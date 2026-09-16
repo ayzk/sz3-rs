@@ -93,7 +93,22 @@ func(impl_i32, int32_t, SZ_INT32)
 func(impl_u64, uint64_t, SZ_UINT64)
 func(impl_i64, int64_t, SZ_INT64)
 
+// magic(4) + version(4) + payload length(8), little endian.
+static constexpr size_t SZ3_HEADER_LEN = sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint64_t);
+
+// What a buffer that does not describe an SZ3 stream reports: no dimensions, no elements.
+static SZ3_Config unreadable_config() {
+    auto conf = SZ3::Config{};
+    auto out = SZ3_Config(conf);
+    out.N = 0;
+    out.num = 0;
+    return out;
+}
+
 SZ3_Config decompress_config(const char * compressedData, size_t compressedSize) {
+    if (compressedSize < SZ3_HEADER_LEN) {
+        return unreadable_config();
+    }
     auto cmpDataPos = reinterpret_cast<const SZ3::uchar *>(compressedData);
     uint32_t magic;
     SZ3::read(magic, cmpDataPos);
@@ -101,6 +116,10 @@ SZ3_Config decompress_config(const char * compressedData, size_t compressedSize)
     SZ3::read(ver, cmpDataPos);
     uint64_t cmpDataSize;
     SZ3::read(cmpDataSize,  cmpDataPos);
+    // cmpDataSize comes out of the buffer, so it can name an offset past its end.
+    if (cmpDataSize > compressedSize - SZ3_HEADER_LEN) {
+        return unreadable_config();
+    }
     auto cmpConfPos = cmpDataPos + cmpDataSize;
     auto conf = SZ3::Config{};
     conf.load(cmpConfPos);
