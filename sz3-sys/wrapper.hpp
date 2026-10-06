@@ -96,12 +96,14 @@ func(impl_i64, int64_t, SZ_INT64)
 // magic(4) + version(4) + payload length(8), little endian.
 static constexpr size_t SZ3_HEADER_LEN = sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint64_t);
 
-// What a buffer that does not describe an SZ3 stream reports: no dimensions, no elements.
+// What a buffer that does not describe an SZ3 stream reports: no dimensions, no elements, and a data type that matches
+// no element type, so decompressing it fails the data type check.
 static SZ3_Config unreadable_config() {
     auto conf = SZ3::Config{};
     auto out = SZ3_Config(conf);
     out.N = 0;
     out.num = 0;
+    out.dataType = UINT8_MAX;
     return out;
 }
 
@@ -121,8 +123,13 @@ SZ3_Config decompress_config(const char * compressedData, size_t compressedSize)
         return unreadable_config();
     }
     auto cmpConfPos = cmpDataPos + cmpDataSize;
+    size_t remaining = compressedSize - SZ3_HEADER_LEN - cmpDataSize;
     auto conf = SZ3::Config{};
-    conf.load(cmpConfPos);
+    try {
+        conf.load(cmpConfPos, remaining);
+    } catch (const std::exception &) {
+        return unreadable_config();
+    }
     return SZ3_Config(conf);
 }
 

@@ -13,7 +13,6 @@ pub enum CompressionAlgorithm {
         regression: bool,
     },
     BiologyMolecularData,
-    BiologyMolecularDataGromacsXtc,
     NoPrediction,
     Lossless,
 }
@@ -29,7 +28,6 @@ impl CompressionAlgorithm {
                 regression: config.regression,
             },
             sz3_sys::SZ3::ALGO_ALGO_BIOMD => Self::BiologyMolecularData,
-            sz3_sys::SZ3::ALGO_ALGO_BIOMDXTC => Self::BiologyMolecularDataGromacsXtc,
             sz3_sys::SZ3::ALGO_ALGO_NOPRED => Self::NoPrediction,
             sz3_sys::SZ3::ALGO_ALGO_LOSSLESS => Self::Lossless,
             algo => panic!("unsupported compression algorithm {}", algo),
@@ -42,7 +40,6 @@ impl CompressionAlgorithm {
             Self::InterpolationLorenzo { .. } => sz3_sys::SZ3::ALGO_ALGO_INTERP_LORENZO,
             Self::LorenzoRegression { .. } => sz3_sys::SZ3::ALGO_ALGO_LORENZO_REG,
             Self::BiologyMolecularData => sz3_sys::SZ3::ALGO_ALGO_BIOMD,
-            Self::BiologyMolecularDataGromacsXtc => sz3_sys::SZ3::ALGO_ALGO_BIOMDXTC,
             Self::NoPrediction => sz3_sys::SZ3::ALGO_ALGO_NOPRED,
             Self::Lossless => sz3_sys::SZ3::ALGO_ALGO_LOSSLESS,
         }) as _
@@ -102,10 +99,6 @@ impl CompressionAlgorithm {
 
     pub fn biology_molecular_data() -> Self {
         Self::BiologyMolecularData
-    }
-
-    pub fn biology_molecular_data_gromacs_xtc() -> Self {
-        Self::BiologyMolecularDataGromacsXtc
     }
 
     pub fn no_prediction() -> Self {
@@ -718,35 +711,6 @@ mod tests {
             .fold(f64::MIN, f64::max);
         let range = max - min;
 
-        // the BIOMDXTC algorithm uses non-strict error bounding, see
-        // https://github.com/apertus-open-source-cinema/sz3-rs/pull/11#discussion_r2548199107
-        let error_bound = if let CompressionAlgorithm::BiologyMolecularDataGromacsXtc =
-            config.compression_algorithm
-        {
-            match error_bound {
-                ErrorBound::Absolute(absolute_bound) => ErrorBound::Absolute(absolute_bound * 2.0),
-                ErrorBound::Relative(relative_bound) => ErrorBound::Relative(relative_bound * 2.0),
-                ErrorBound::PSNR(psnr_bound) => ErrorBound::PSNR(psnr_bound * 2.0),
-                ErrorBound::L2Norm(l2norm_bound) => ErrorBound::L2Norm(l2norm_bound * 2.0),
-                ErrorBound::AbsoluteAndRelative {
-                    absolute_bound,
-                    relative_bound,
-                } => ErrorBound::AbsoluteAndRelative {
-                    absolute_bound: absolute_bound * 2.0,
-                    relative_bound: relative_bound * 2.0,
-                },
-                ErrorBound::AbsoluteOrRelative {
-                    absolute_bound,
-                    relative_bound,
-                } => ErrorBound::AbsoluteOrRelative {
-                    absolute_bound: absolute_bound * 2.0,
-                    relative_bound: relative_bound * 2.0,
-                },
-            }
-        } else {
-            error_bound
-        };
-
         match error_bound {
             ErrorBound::Absolute(absolute_bound) => {
                 for (orig, compressed) in data.data().iter().zip(decompressed_data.data()) {
@@ -852,10 +816,20 @@ mod tests {
                 #[test]
                 fn [<test_ $openmp _ $eb_name _ $ca_name _ $qb _ $block_size>]() -> Result<()> {
                     let data = test_data::<f32>();
-                    let data = DimensionedData::build(&data)
-                        .dim(64)?
-                        .dim(64)?
-                        .remainder_dim()?;
+                    // ALGO_BIOMD takes coordinates, {frames, atoms, 3}
+                    let biomd = matches!($ca, CompressionAlgorithm::BiologyMolecularData);
+                    let data = if biomd { data[..data.len() / 192 * 192].to_vec() } else { data };
+                    let data = if biomd {
+                        DimensionedData::build(&data)
+                            .dim(64)?
+                            .dim(data.len() / 192)?
+                            .remainder_dim()?
+                    } else {
+                        DimensionedData::build(&data)
+                            .dim(64)?
+                            .dim(64)?
+                            .remainder_dim()?
+                    };
                     let config = Config::new($eb)
                         .error_bound($eb)
                         .compression_algorithm($ca)
@@ -937,7 +911,6 @@ mod tests {
                 Some(true),
             )),
             (biomd, CompressionAlgorithm::BiologyMolecularData),
-            (biomdxtc, CompressionAlgorithm::BiologyMolecularDataGromacsXtc),
             (no_prediction, CompressionAlgorithm::NoPrediction),
             (lossless, CompressionAlgorithm::Lossless)
         ],
