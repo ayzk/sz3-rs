@@ -234,7 +234,7 @@ mod private {
             compressed_data: *const u8,
             compressed_len: usize,
             decompressed_data: *mut Self,
-        );
+        ) -> bool;
     }
 
     macro_rules! impl_sealed {
@@ -259,7 +259,7 @@ mod private {
                     compressed_data: *const u8,
                     compressed_len: usize,
                     decompressed_data: *mut Self,
-                ) {
+                ) -> bool {
                     sz3_sys::$impl::decompress(compressed_data.cast(), compressed_len, decompressed_data)
                 }
             })*
@@ -367,6 +367,10 @@ pub enum SZ3Error {
         found: Vec<usize>,
         expected: Vec<usize>,
     },
+    #[error("SZ3 failed to compress the data")]
+    CompressionFailed,
+    #[error("SZ3 failed to decompress the data")]
+    DecompressionFailed,
 }
 
 type Result<T> = std::result::Result<T, SZ3Error>;
@@ -536,6 +540,9 @@ pub fn compress_into_with_config<V: SZ3Compressible, T: std::ops::Deref<Target =
     };
 
     let capacity: usize = unsafe { V::compress_size_bound(raw_config) };
+    if capacity == 0 {
+        return Err(SZ3Error::CompressionFailed);
+    }
     compressed_data.reserve(capacity);
 
     let len = unsafe {
@@ -549,6 +556,9 @@ pub fn compress_into_with_config<V: SZ3Compressible, T: std::ops::Deref<Target =
             capacity,
         )
     };
+    if len == 0 {
+        return Err(SZ3Error::CompressionFailed);
+    }
     unsafe { compressed_data.set_len(compressed_data.len() + len) };
 
     Ok(())
@@ -572,14 +582,16 @@ pub fn decompress<V: SZ3Compressible, T: std::ops::Deref<Target = [u8]>>(
         let mut decompressed_data = Vec::with_capacity(len);
 
         // safety: decompressed data is uninitialized and valid for 0..len
-        V::decompress(
+        if !V::decompress(
             compressed_data.as_ptr(),
             compressed_data.len(),
             decompressed_data
                 .spare_capacity_mut()
                 .as_mut_ptr()
                 .cast::<V>(),
-        );
+        ) {
+            return Err(SZ3Error::DecompressionFailed);
+        }
 
         // safety: decompressed data is initialized for 0..len
         decompressed_data.set_len(len);
@@ -626,12 +638,14 @@ pub fn decompress_into_dimensioned<
 
     // safety: decompressed data is initialized for 0..len
     //         *and* V: Copy, so we can just override the elements
-    unsafe {
+    if !unsafe {
         V::decompress(
             compressed_data.as_ptr(),
             compressed_data.len(),
             decompressed_data.data.as_mut_ptr(),
-        );
+        )
+    } {
+        return Err(SZ3Error::DecompressionFailed);
     }
 
     Ok(config)
@@ -818,11 +832,11 @@ mod tests {
                     let data = test_data::<f32>();
                     // ALGO_BIOMD takes coordinates, {frames, atoms, 3}
                     let biomd = matches!($ca, CompressionAlgorithm::BiologyMolecularData);
-                    let data = if biomd { data[..data.len() / 192 * 192].to_vec() } else { data };
+                    let data = if biomd { data[..(64 * 192 * 3)].to_vec() } else { data };
                     let data = if biomd {
                         DimensionedData::build(&data)
                             .dim(64)?
-                            .dim(data.len() / 192)?
+                            .dim(192)?
                             .remainder_dim()?
                     } else {
                         DimensionedData::build(&data)
@@ -917,4 +931,21 @@ mod tests {
         ([65536, 256, 2097152],
         ([2, 4, 8, 16])))));
         gen_test, ());
+
+    #[test]
+    fn sz3_exception_is_an_error() -> Result<()> {
+        // ALGO_BIOMD throws on data whose last dimension is not 3
+        let data = test_data::<f32>();
+        let data = DimensionedData::build(&data)
+            .dim(64)?
+            .dim(64)?
+            .remainder_dim()?;
+        let config = Config::new(ErrorBound::Absolute(0.1))
+            .compression_algorithm(CompressionAlgorithm::BiologyMolecularData);
+        assert!(matches!(
+            compress_with_config(&data, &config),
+            Err(SZ3Error::CompressionFailed)
+        ));
+        Ok(())
+    }
 }

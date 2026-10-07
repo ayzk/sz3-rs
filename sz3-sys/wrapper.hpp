@@ -69,15 +69,29 @@ struct SZ3_Config {
 	enum DATA_TYPE : uint8_t { \
       TYPE = dt \
     }; \
+    /* An exception must not cross into Rust: 0 and false report one instead. */ \
     size_t compress_size_bound(SZ3_Config config) { \
-        return SZ3::SZ_compress_size_bound<ty>(config.into()); \
+        try { \
+            return SZ3::SZ_compress_size_bound<ty>(config.into()); \
+        } catch (...) { \
+            return 0; \
+        } \
     } \
     size_t compress(SZ3_Config config, const ty * data, char * compressedData, size_t compressedCapacity) { \
-        return SZ_compress<ty>(config.into(), data, compressedData, compressedCapacity); \
+        try { \
+            return SZ_compress<ty>(config.into(), data, compressedData, compressedCapacity); \
+        } catch (...) { \
+            return 0; \
+        } \
     } \
-    void decompress(const char * compressedData, size_t compressedSize, ty * decompressedData) { \
-        auto conf = SZ3::Config{}; \
-        SZ_decompress<ty>(conf, compressedData, compressedSize, decompressedData); \
+    bool decompress(const char * compressedData, size_t compressedSize, ty * decompressedData) { \
+        try { \
+            auto conf = SZ3::Config{}; \
+            SZ_decompress<ty>(conf, compressedData, compressedSize, decompressedData); \
+            return true; \
+        } catch (...) { \
+            return false; \
+        } \
     } \
   }
 
@@ -96,8 +110,7 @@ func(impl_i64, int64_t, SZ_INT64)
 // magic(4) + version(4) + payload length(8), little endian.
 static constexpr size_t SZ3_HEADER_LEN = sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint64_t);
 
-// What a buffer that does not describe an SZ3 stream reports: no dimensions, no elements, and a data type that matches
-// no element type, so decompressing it fails the data type check.
+// Produce a configuration that does not describe a valid SZ3 stream, without dimensions, elements, and an invalid data type
 static SZ3_Config unreadable_config() {
     auto conf = SZ3::Config{};
     auto out = SZ3_Config(conf);
