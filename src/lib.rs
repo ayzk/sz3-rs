@@ -367,6 +367,11 @@ pub enum SZ3Error {
         found: Vec<usize>,
         expected: Vec<usize>,
     },
+    #[error(
+        "BiologyMolecularData compresses coordinates of shape {{atoms, 3}} or {{frames, atoms, 3}}, \
+         not dimensions {dims:?}"
+    )]
+    BiologyMolecularDataShape { dims: Vec<usize> },
     #[error("SZ3 failed to compress the data")]
     CompressionFailed,
     #[error("SZ3 failed to decompress the data")]
@@ -514,6 +519,16 @@ pub fn compress_into_with_config<V: SZ3Compressible, T: std::ops::Deref<Target =
     config: &Config,
     compressed_data: &mut Vec<u8>,
 ) -> Result<()> {
+    if matches!(
+        config.compression_algorithm,
+        CompressionAlgorithm::BiologyMolecularData
+    ) && (data.dims().len() > 3 || data.dims().last() != Some(&3))
+    {
+        return Err(SZ3Error::BiologyMolecularDataShape {
+            dims: data.dims().to_vec(),
+        });
+    }
+
     let block_size = config.block_size.unwrap_or(match data.dims().len() {
         1 => 128,
         2 => 16,
@@ -933,8 +948,7 @@ mod tests {
         gen_test, ());
 
     #[test]
-    fn sz3_exception_is_an_error() -> Result<()> {
-        // ALGO_BIOMD throws on data whose last dimension is not 3
+    fn biomd_checks_the_shape() -> Result<()> {
         let data = test_data::<f32>();
         let data = DimensionedData::build(&data)
             .dim(64)?
@@ -944,7 +958,7 @@ mod tests {
             .compression_algorithm(CompressionAlgorithm::BiologyMolecularData);
         assert!(matches!(
             compress_with_config(&data, &config),
-            Err(SZ3Error::CompressionFailed)
+            Err(SZ3Error::BiologyMolecularDataShape { .. })
         ));
         Ok(())
     }
