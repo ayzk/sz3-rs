@@ -221,20 +221,27 @@ mod private {
     pub trait Sealed: Copy {
         const SZ_DATA_TYPE: u8;
 
-        unsafe fn compress_size_bound(config: sz3_sys::SZ3_Config) -> usize;
+        unsafe fn compress_size_bound(
+            config: sz3_sys::SZ3_Config,
+            bound: *mut usize,
+            message: *mut *mut std::ffi::c_char,
+        ) -> sz3_sys::SZ3_ErrorKind;
 
         unsafe fn compress(
             config: sz3_sys::SZ3_Config,
             data: *const Self,
             compressed_data: *mut u8,
             compressed_capacity: usize,
-        ) -> usize;
+            compressed_len: *mut usize,
+            message: *mut *mut std::ffi::c_char,
+        ) -> sz3_sys::SZ3_ErrorKind;
 
         unsafe fn decompress(
             compressed_data: *const u8,
             compressed_len: usize,
             decompressed_data: *mut Self,
-        ) -> bool;
+            message: *mut *mut std::ffi::c_char,
+        ) -> sz3_sys::SZ3_ErrorKind;
     }
 
     macro_rules! impl_sealed {
@@ -242,8 +249,12 @@ mod private {
             $(impl Sealed for sz3_sys::$impl::ty {
                 const SZ_DATA_TYPE: u8 = sz3_sys::$impl::DATA_TYPE_TYPE;
 
-                unsafe fn compress_size_bound(config: sz3_sys::SZ3_Config) -> usize {
-                    sz3_sys::$impl::compress_size_bound(config)
+                unsafe fn compress_size_bound(
+                    config: sz3_sys::SZ3_Config,
+                    bound: *mut usize,
+                    message: *mut *mut std::ffi::c_char,
+                ) -> sz3_sys::SZ3_ErrorKind {
+                    sz3_sys::$impl::compress_size_bound(config, bound, message)
                 }
 
                 unsafe fn compress(
@@ -251,16 +262,26 @@ mod private {
                     data: *const Self,
                     compressed_data: *mut u8,
                     compressed_capacity: usize,
-                ) -> usize {
-                    sz3_sys::$impl::compress(config, data, compressed_data.cast(), compressed_capacity)
+                    compressed_len: *mut usize,
+                    message: *mut *mut std::ffi::c_char,
+                ) -> sz3_sys::SZ3_ErrorKind {
+                    sz3_sys::$impl::compress(
+                        config,
+                        data,
+                        compressed_data.cast(),
+                        compressed_capacity,
+                        compressed_len,
+                        message,
+                    )
                 }
 
                 unsafe fn decompress(
                     compressed_data: *const u8,
                     compressed_len: usize,
                     decompressed_data: *mut Self,
-                ) -> bool {
-                    sz3_sys::$impl::decompress(compressed_data.cast(), compressed_len, decompressed_data)
+                    message: *mut *mut std::ffi::c_char,
+                ) -> sz3_sys::SZ3_ErrorKind {
+                    sz3_sys::$impl::decompress(compressed_data.cast(), compressed_len, decompressed_data, message)
                 }
             })*
         }
@@ -372,13 +393,50 @@ pub enum SZ3Error {
          not dimensions {dims:?}"
     )]
     BiologyMolecularDataShape { dims: Vec<usize> },
-    #[error("SZ3 failed to compress the data")]
-    CompressionFailed,
-    #[error("SZ3 failed to decompress the data")]
-    DecompressionFailed,
+    #[error("SZ3 reported an error ({kind:?}): {message}")]
+    InternalError {
+        kind: InternalErrorKind,
+        message: String,
+    },
+}
+
+/// The kind of exception SZ3 threw
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InternalErrorKind {
+    /// Unsupported configuration, data type or dimensions
+    InvalidArgument,
+    /// Truncated or corrupt compressed data
+    OutOfRange,
+    Runtime,
+    OutOfMemory,
+    Other,
 }
 
 type Result<T> = std::result::Result<T, SZ3Error>;
+
+/// Turns what a wrapper function returned into a `Result`, taking ownership of the message.
+fn check(kind: sz3_sys::SZ3_ErrorKind, message: *mut std::ffi::c_char) -> Result<()> {
+    let kind = match kind {
+        sz3_sys::SZ3_ErrorKind_SZ3_OK => return Ok(()),
+        sz3_sys::SZ3_ErrorKind_SZ3_INVALID_ARGUMENT => InternalErrorKind::InvalidArgument,
+        sz3_sys::SZ3_ErrorKind_SZ3_OUT_OF_RANGE => InternalErrorKind::OutOfRange,
+        sz3_sys::SZ3_ErrorKind_SZ3_RUNTIME => InternalErrorKind::Runtime,
+        sz3_sys::SZ3_ErrorKind_SZ3_OUT_OF_MEMORY => InternalErrorKind::OutOfMemory,
+        _ => InternalErrorKind::Other,
+    };
+    // the wrapper leaves the message null if it could not allocate it
+    let message = if message.is_null() {
+        String::new()
+    } else {
+        let copy = unsafe { std::ffi::CStr::from_ptr(message) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { sz3_sys::free_error_message(message) };
+        copy
+    };
+    Err(SZ3Error::InternalError { kind, message })
+}
 
 macro_rules! impl_dimensioned_data_builder {
     ($($builder:ident => $data:ty),*) => {
@@ -554,26 +612,32 @@ pub fn compress_into_with_config<V: SZ3Compressible, T: std::ops::Deref<Target =
         quantbinCnt: config.quantization_bincount as _,
     };
 
-    let capacity: usize = unsafe { V::compress_size_bound(raw_config) };
-    if capacity == 0 {
-        return Err(SZ3Error::CompressionFailed);
-    }
+    let mut message = std::ptr::null_mut();
+
+    let mut capacity: usize = 0;
+    check(
+        unsafe { V::compress_size_bound(raw_config, &mut capacity, &mut message) },
+        message,
+    )?;
     compressed_data.reserve(capacity);
 
-    let len = unsafe {
-        V::compress(
-            raw_config,
-            data.as_ptr(),
-            compressed_data
-                .spare_capacity_mut()
-                .as_mut_ptr()
-                .cast::<u8>(),
-            capacity,
-        )
-    };
-    if len == 0 {
-        return Err(SZ3Error::CompressionFailed);
-    }
+    let mut len: usize = 0;
+    check(
+        unsafe {
+            V::compress(
+                raw_config,
+                data.as_ptr(),
+                compressed_data
+                    .spare_capacity_mut()
+                    .as_mut_ptr()
+                    .cast::<u8>(),
+                capacity,
+                &mut len,
+                &mut message,
+            )
+        },
+        message,
+    )?;
     unsafe { compressed_data.set_len(compressed_data.len() + len) };
 
     Ok(())
@@ -587,7 +651,7 @@ pub fn decompress<V: SZ3Compressible, T: std::ops::Deref<Target = [u8]>>(
         len,
         dims,
         data_type,
-    } = DecompressedConfig::from_compressed(&compressed_data);
+    } = DecompressedConfig::from_compressed(&compressed_data)?;
 
     if data_type != (V::SZ_DATA_TYPE as _) {
         return Err(SZ3Error::DecompressedDataTypeMismatch);
@@ -597,16 +661,19 @@ pub fn decompress<V: SZ3Compressible, T: std::ops::Deref<Target = [u8]>>(
         let mut decompressed_data = Vec::with_capacity(len);
 
         // safety: decompressed data is uninitialized and valid for 0..len
-        if !V::decompress(
-            compressed_data.as_ptr(),
-            compressed_data.len(),
-            decompressed_data
-                .spare_capacity_mut()
-                .as_mut_ptr()
-                .cast::<V>(),
-        ) {
-            return Err(SZ3Error::DecompressionFailed);
-        }
+        let mut message = std::ptr::null_mut();
+        check(
+            V::decompress(
+                compressed_data.as_ptr(),
+                compressed_data.len(),
+                decompressed_data
+                    .spare_capacity_mut()
+                    .as_mut_ptr()
+                    .cast::<V>(),
+                &mut message,
+            ),
+            message,
+        )?;
 
         // safety: decompressed data is initialized for 0..len
         decompressed_data.set_len(len);
@@ -635,7 +702,7 @@ pub fn decompress_into_dimensioned<
         len,
         dims,
         data_type,
-    } = DecompressedConfig::from_compressed(&compressed_data);
+    } = DecompressedConfig::from_compressed(&compressed_data)?;
 
     if data_type != (V::SZ_DATA_TYPE as _) {
         return Err(SZ3Error::DecompressedDataTypeMismatch);
@@ -653,15 +720,18 @@ pub fn decompress_into_dimensioned<
 
     // safety: decompressed data is initialized for 0..len
     //         *and* V: Copy, so we can just override the elements
-    if !unsafe {
-        V::decompress(
-            compressed_data.as_ptr(),
-            compressed_data.len(),
-            decompressed_data.data.as_mut_ptr(),
-        )
-    } {
-        return Err(SZ3Error::DecompressionFailed);
-    }
+    let mut message = std::ptr::null_mut();
+    check(
+        unsafe {
+            V::decompress(
+                compressed_data.as_ptr(),
+                compressed_data.len(),
+                decompressed_data.data.as_mut_ptr(),
+                &mut message,
+            )
+        },
+        message,
+    )?;
 
     Ok(config)
 }
@@ -674,10 +744,22 @@ struct DecompressedConfig {
 }
 
 impl DecompressedConfig {
-    fn from_compressed(compressed_data: &[u8]) -> Self {
-        let config = unsafe {
-            sz3_sys::decompress_config(compressed_data.as_ptr().cast(), compressed_data.len())
-        };
+    fn from_compressed(compressed_data: &[u8]) -> Result<Self> {
+        let mut config = std::mem::MaybeUninit::<SZ3_Config>::uninit();
+        let mut message = std::ptr::null_mut();
+        check(
+            unsafe {
+                sz3_sys::decompress_config(
+                    compressed_data.as_ptr().cast(),
+                    compressed_data.len(),
+                    config.as_mut_ptr(),
+                    &mut message,
+                )
+            },
+            message,
+        )?;
+        // safety: decompress_config initialized the config when it returned SZ3_OK
+        let config = unsafe { config.assume_init() };
         let dims = (0..config.N)
             .map(|i| unsafe { std::ptr::read(config.dims.add(i as _)) })
             .collect();
@@ -690,12 +772,12 @@ impl DecompressedConfig {
             ..
         } = config;
         let config = Config::from_decompressed(config);
-        Self {
+        Ok(Self {
             config,
             len,
             dims,
             data_type,
-        }
+        })
     }
 }
 
@@ -946,6 +1028,57 @@ mod tests {
         ([65536, 256, 2097152],
         ([2, 4, 8, 16])))));
         gen_test, ());
+
+    fn compressed_test_data() -> Result<Vec<u8>> {
+        let data = test_data::<f32>();
+        let data = DimensionedData::build(&data)
+            .dim(64)?
+            .dim(64)?
+            .remainder_dim()?;
+        compress(&data, ErrorBound::Absolute(0.1))
+    }
+
+    fn internal_error_kind<T: std::fmt::Debug>(result: Result<T>) -> Option<InternalErrorKind> {
+        match result {
+            Err(SZ3Error::InternalError { kind, message }) => {
+                assert!(!message.is_empty());
+                Some(kind)
+            }
+            other => panic!("expected an InternalError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decompress_refuses_data_shorter_than_the_header() -> Result<()> {
+        let compressed = compressed_test_data()?;
+        assert_eq!(
+            internal_error_kind(decompress::<f32, _>(&compressed[..10])),
+            Some(InternalErrorKind::OutOfRange)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn decompress_refuses_a_payload_past_the_end() -> Result<()> {
+        let mut compressed = compressed_test_data()?;
+        // the payload length, after the magic and the version
+        compressed[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(
+            internal_error_kind(decompress::<f32, _>(&compressed[..])),
+            Some(InternalErrorKind::OutOfRange)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn decompress_refuses_a_truncated_config() -> Result<()> {
+        let compressed = compressed_test_data()?;
+        assert_eq!(
+            internal_error_kind(decompress::<f32, _>(&compressed[..compressed.len() - 4])),
+            Some(InternalErrorKind::OutOfRange)
+        );
+        Ok(())
+    }
 
     #[test]
     fn biomd_checks_the_shape() -> Result<()> {
