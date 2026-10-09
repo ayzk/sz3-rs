@@ -36,7 +36,7 @@ fn main() {
         .allowlist_type("SZ3::EB")
         .allowlist_type("SZ3::ALGO")
         .allowlist_type("SZ_DATA_TYPE")
-        .allowlist_type("SZ3_ErrorKind")
+        .allowlist_type("SZ3_Status")
         .allowlist_function("dealloc_size_t")
         .allowlist_function("free_error_message")
         .allowlist_function("decompress_config")

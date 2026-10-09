@@ -225,7 +225,7 @@ mod private {
             config: sz3_sys::SZ3_Config,
             bound: *mut usize,
             message: *mut *mut std::ffi::c_char,
-        ) -> sz3_sys::SZ3_ErrorKind;
+        ) -> sz3_sys::SZ3_Status;
 
         unsafe fn compress(
             config: sz3_sys::SZ3_Config,
@@ -234,14 +234,14 @@ mod private {
             compressed_capacity: usize,
             compressed_len: *mut usize,
             message: *mut *mut std::ffi::c_char,
-        ) -> sz3_sys::SZ3_ErrorKind;
+        ) -> sz3_sys::SZ3_Status;
 
         unsafe fn decompress(
             compressed_data: *const u8,
             compressed_len: usize,
             decompressed_data: *mut Self,
             message: *mut *mut std::ffi::c_char,
-        ) -> sz3_sys::SZ3_ErrorKind;
+        ) -> sz3_sys::SZ3_Status;
     }
 
     macro_rules! impl_sealed {
@@ -253,7 +253,7 @@ mod private {
                     config: sz3_sys::SZ3_Config,
                     bound: *mut usize,
                     message: *mut *mut std::ffi::c_char,
-                ) -> sz3_sys::SZ3_ErrorKind {
+                ) -> sz3_sys::SZ3_Status {
                     sz3_sys::$impl::compress_size_bound(config, bound, message)
                 }
 
@@ -264,7 +264,7 @@ mod private {
                     compressed_capacity: usize,
                     compressed_len: *mut usize,
                     message: *mut *mut std::ffi::c_char,
-                ) -> sz3_sys::SZ3_ErrorKind {
+                ) -> sz3_sys::SZ3_Status {
                     sz3_sys::$impl::compress(
                         config,
                         data,
@@ -280,7 +280,7 @@ mod private {
                     compressed_len: usize,
                     decompressed_data: *mut Self,
                     message: *mut *mut std::ffi::c_char,
-                ) -> sz3_sys::SZ3_ErrorKind {
+                ) -> sz3_sys::SZ3_Status {
                     sz3_sys::$impl::decompress(compressed_data.cast(), compressed_len, decompressed_data, message)
                 }
             })*
@@ -400,7 +400,7 @@ pub enum SZ3Error {
     },
 }
 
-/// The kind of exception SZ3 threw
+/// Kinds of internal SZ3 errors
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum InternalErrorKind {
@@ -415,14 +415,17 @@ pub enum InternalErrorKind {
 
 type Result<T> = std::result::Result<T, SZ3Error>;
 
-/// Turns what a wrapper function returned into a `Result`, taking ownership of the message.
-fn check(kind: sz3_sys::SZ3_ErrorKind, message: *mut std::ffi::c_char) -> Result<()> {
+/// Convert the SZ3 return status and error message into a `Result`
+///
+/// The wrapper sets the message only when it returns an error, so callers pass it in null, and on
+/// `SZ3_OK` it is still null. On an error this takes ownership of the message and frees it.
+fn check_sz3_status(kind: sz3_sys::SZ3_Status, message: *mut std::ffi::c_char) -> Result<()> {
     let kind = match kind {
-        sz3_sys::SZ3_ErrorKind_SZ3_OK => return Ok(()),
-        sz3_sys::SZ3_ErrorKind_SZ3_INVALID_ARGUMENT => InternalErrorKind::InvalidArgument,
-        sz3_sys::SZ3_ErrorKind_SZ3_OUT_OF_RANGE => InternalErrorKind::OutOfRange,
-        sz3_sys::SZ3_ErrorKind_SZ3_RUNTIME => InternalErrorKind::Runtime,
-        sz3_sys::SZ3_ErrorKind_SZ3_OUT_OF_MEMORY => InternalErrorKind::OutOfMemory,
+        sz3_sys::SZ3_Status_SZ3_OK => return Ok(()),
+        sz3_sys::SZ3_Status_SZ3_INVALID_ARGUMENT => InternalErrorKind::InvalidArgument,
+        sz3_sys::SZ3_Status_SZ3_OUT_OF_RANGE => InternalErrorKind::OutOfRange,
+        sz3_sys::SZ3_Status_SZ3_RUNTIME => InternalErrorKind::Runtime,
+        sz3_sys::SZ3_Status_SZ3_OUT_OF_MEMORY => InternalErrorKind::OutOfMemory,
         _ => InternalErrorKind::Other,
     };
     // the wrapper leaves the message null if it could not allocate it
@@ -615,14 +618,14 @@ pub fn compress_into_with_config<V: SZ3Compressible, T: std::ops::Deref<Target =
     let mut message = std::ptr::null_mut();
 
     let mut capacity: usize = 0;
-    check(
+    check_sz3_status(
         unsafe { V::compress_size_bound(raw_config, &mut capacity, &mut message) },
         message,
     )?;
     compressed_data.reserve(capacity);
 
     let mut len: usize = 0;
-    check(
+    check_sz3_status(
         unsafe {
             V::compress(
                 raw_config,
@@ -662,7 +665,7 @@ pub fn decompress<V: SZ3Compressible, T: std::ops::Deref<Target = [u8]>>(
 
         // safety: decompressed data is uninitialized and valid for 0..len
         let mut message = std::ptr::null_mut();
-        check(
+        check_sz3_status(
             V::decompress(
                 compressed_data.as_ptr(),
                 compressed_data.len(),
@@ -721,7 +724,7 @@ pub fn decompress_into_dimensioned<
     // safety: decompressed data is initialized for 0..len
     //         *and* V: Copy, so we can just override the elements
     let mut message = std::ptr::null_mut();
-    check(
+    check_sz3_status(
         unsafe {
             V::decompress(
                 compressed_data.as_ptr(),
@@ -747,7 +750,7 @@ impl DecompressedConfig {
     fn from_compressed(compressed_data: &[u8]) -> Result<Self> {
         let mut config = std::mem::MaybeUninit::<SZ3_Config>::uninit();
         let mut message = std::ptr::null_mut();
-        check(
+        check_sz3_status(
             unsafe {
                 sz3_sys::decompress_config(
                     compressed_data.as_ptr().cast(),

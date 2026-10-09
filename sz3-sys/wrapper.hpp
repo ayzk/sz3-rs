@@ -67,9 +67,12 @@ struct SZ3_Config {
 };
 
 
-// What a wrapper function returns. On an error other than SZ3_OK it also sets *message to a copy of the exception's
-// message, which the caller frees with free_error_message.
-enum SZ3_ErrorKind : int {
+// Status code returned by the wrapper functions.
+//
+// When `SZ3_OK` is returned, the error `message` is left null.
+//
+// When an error is returned, the error `*message` is set to a copy of the exception's message, which the caller has to free with `free_error_message`.
+enum SZ3_Status : int {
     SZ3_OK = 0,
     SZ3_INVALID_ARGUMENT = 1,
     SZ3_OUT_OF_RANGE = 2,
@@ -78,8 +81,8 @@ enum SZ3_ErrorKind : int {
     SZ3_OTHER = 5,
 };
 
-// malloc, not new: it runs after a std::bad_alloc too, and gives nullptr instead of throwing.
-static SZ3_ErrorKind fail(SZ3_ErrorKind kind, const char * what, char ** message) {
+// Use malloc, not new, since it runs after a std::bad_alloc too and returns nullptr instead of throwing.
+static SZ3_Status fail(SZ3_Status kind, const char * what, char ** message) {
     size_t len = std::strlen(what);
     *message = static_cast<char *>(std::malloc(len + 1));
     if (*message) {
@@ -90,7 +93,7 @@ static SZ3_ErrorKind fail(SZ3_ErrorKind kind, const char * what, char ** message
 
 // An exception must not cross into Rust: each is turned into its kind and message.
 template <typename F>
-static SZ3_ErrorKind catch_sz3(char ** message, F && f) {
+static SZ3_Status catch_sz3(char ** message, F && f) {
     try {
         f();
         return SZ3_OK;
@@ -119,16 +122,16 @@ void free_error_message(char * message) {
 	enum DATA_TYPE : uint8_t { \
       TYPE = dt \
     }; \
-    SZ3_ErrorKind compress_size_bound(SZ3_Config config, size_t * bound, char ** message) { \
+    SZ3_Status compress_size_bound(SZ3_Config config, size_t * bound, char ** message) { \
         return catch_sz3(message, [&] { *bound = SZ3::SZ_compress_size_bound<ty>(config.into()); }); \
     } \
-    SZ3_ErrorKind compress(SZ3_Config config, const ty * data, char * compressedData, size_t compressedCapacity, \
+    SZ3_Status compress(SZ3_Config config, const ty * data, char * compressedData, size_t compressedCapacity, \
                            size_t * compressedSize, char ** message) { \
         return catch_sz3(message, [&] { \
             *compressedSize = SZ_compress<ty>(config.into(), data, compressedData, compressedCapacity); \
         }); \
     } \
-    SZ3_ErrorKind decompress(const char * compressedData, size_t compressedSize, ty * decompressedData, \
+    SZ3_Status decompress(const char * compressedData, size_t compressedSize, ty * decompressedData, \
                              char ** message) { \
         return catch_sz3(message, [&] { \
             auto conf = SZ3::Config{}; \
@@ -152,7 +155,7 @@ func(impl_i64, int64_t, SZ_INT64)
 // magic(4) + version(4) + payload length(8), little endian.
 static constexpr size_t SZ3_HEADER_LEN = sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint64_t);
 
-SZ3_ErrorKind decompress_config(const char * compressedData, size_t compressedSize, SZ3_Config * config,
+SZ3_Status decompress_config(const char * compressedData, size_t compressedSize, SZ3_Config * config,
                                 char ** message) {
     if (compressedSize < SZ3_HEADER_LEN) {
         return fail(SZ3_OUT_OF_RANGE, "SZ3 data is shorter than its header", message);
